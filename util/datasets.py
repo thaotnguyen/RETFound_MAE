@@ -4,6 +4,7 @@
 # --------------------------------------------------------
 
 import os
+from eye_age_dataset import EyeAgeDataset
 from torchvision import datasets, transforms
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -12,8 +13,8 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 def build_dataset(is_train, args):
     
     transform = build_transform(is_train, args)
-    root = os.path.join(args.data_path, is_train)
-    dataset = datasets.ImageFolder(root, transform=transform)
+    # root = os.path.join(args.data_path, is_train)
+    dataset = EyeAgeDataset(root_dir=args.data_path, transform=transform, is_train=is_train, fold=args.fold)
 
     return dataset
 

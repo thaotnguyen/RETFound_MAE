@@ -15,6 +15,7 @@ from timm.utils import accuracy
 from typing import Iterable, Optional
 import util.misc as misc
 import util.lr_sched as lr_sched
+from torchmetrics.functional import mean_absolute_error, r2_score
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, average_precision_score,multilabel_confusion_matrix
 from pycm import *
 import matplotlib.pyplot as plt
@@ -79,7 +80,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
@@ -89,11 +90,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         targets = targets.to(device, non_blocking=True)
 
         if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
+            samples, targets, _ = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
             outputs = model(samples)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets.view(-1, 1))
 
         loss_value = loss.item()
 
@@ -138,7 +139,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 @torch.no_grad()
 def evaluate(data_loader, model, device, task, epoch, mode, num_class):
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.L1Loss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -156,53 +157,56 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
 
     for batch in metric_logger.log_every(data_loader, 10, header):
         images = batch[0]
-        target = batch[-1]
+        target = batch[1].view(-1, 1)
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        true_label=F.one_hot(target.to(torch.int64), num_classes=num_class)
+        true_label=target.to(torch.float32)
 
         # compute output
         with torch.cuda.amp.autocast():
             output = model(images)
             loss = criterion(output, target)
-            prediction_softmax = nn.Softmax(dim=1)(output)
-            _,prediction_decode = torch.max(prediction_softmax, 1)
-            _,true_label_decode = torch.max(true_label, 1)
+            prediction_softmax = output
+            prediction_decode = prediction_softmax
+            true_label_decode = true_label
 
             prediction_decode_list.extend(prediction_decode.cpu().detach().numpy())
             true_label_decode_list.extend(true_label_decode.cpu().detach().numpy())
             true_label_onehot_list.extend(true_label.cpu().detach().numpy())
             prediction_list.extend(prediction_softmax.cpu().detach().numpy())
 
-        acc1,_ = accuracy(output, target, topk=(1,2))
+        r2 = r2_score(prediction_decode, true_label_decode) 
+        mae = mean_absolute_error(prediction_decode, true_label_decode)   
+        # acc1,_ = accuracy(output, target, topk=(1,2))
 
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        metric_logger.meters['mae'].update(mae.item(), n=batch_size)
+        metric_logger.meters['r2'].update(r2.item(), n=batch_size)
     # gather the stats from all processes
     true_label_decode_list = np.array(true_label_decode_list)
     prediction_decode_list = np.array(prediction_decode_list)
-    confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list,labels=[i for i in range(num_class)])
-    acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
+    # confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list,labels=[i for i in range(num_class)])
+    # acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
     
-    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list,multi_class='ovr',average='macro')
-    auc_pr = average_precision_score(true_label_onehot_list, prediction_list,average='macro')          
+    # auc_roc = roc_auc_score(true_label_onehot_list, prediction_list,multi_class='ovr',average='macro')
+    # auc_pr = average_precision_score(true_label_onehot_list, prediction_list,average='macro')          
             
     metric_logger.synchronize_between_processes()
     
-    print('Sklearn Metrics - Acc: {:.4f} AUC-roc: {:.4f} AUC-pr: {:.4f} F1-score: {:.4f} MCC: {:.4f}'.format(acc, auc_roc, auc_pr, F1, mcc)) 
+    print('Metrics - MAE: {:.2f}, R2: {:.2f}'.format(mae, r2)) 
     results_path = task+'_metrics_{}.csv'.format(mode)
     with open(results_path,mode='a',newline='',encoding='utf8') as cfa:
         wf = csv.writer(cfa)
-        data2=[[acc,sensitivity,specificity,precision,auc_roc,auc_pr,F1,mcc,metric_logger.loss]]
+        data2=[[mae,r2,metric_logger.loss]]
         for i in data2:
             wf.writerow(i)
             
     
-    if mode=='test':
-        cm = ConfusionMatrix(actual_vector=true_label_decode_list, predict_vector=prediction_decode_list)
-        cm.plot(cmap=plt.cm.Blues,number_label=True,normalized=True,plot_lib="matplotlib")
-        plt.savefig(task+'confusion_matrix_test.jpg',dpi=600,bbox_inches ='tight')
+    # if mode=='test':
+    #     cm = ConfusionMatrix(actual_vector=true_label_decode_list, predict_vector=prediction_decode_list)
+    #     cm.plot(cmap=plt.cm.Blues,number_label=True,normalized=True,plot_lib="matplotlib")
+    #     plt.savefig(task+'confusion_matrix_test.jpg',dpi=600,bbox_inches ='tight')
     
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()},auc_roc
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()},mae
 

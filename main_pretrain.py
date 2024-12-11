@@ -16,6 +16,7 @@ import os
 import time
 from pathlib import Path
 
+from eye_age_dataset import EyeAgeDataset
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
@@ -24,7 +25,7 @@ import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.9.12"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -125,8 +126,7 @@ def main(args):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    dataset_train = EyeAgeDataset(csv_file='data.csv', root_dir='Good_quality', transform=transform_train)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()

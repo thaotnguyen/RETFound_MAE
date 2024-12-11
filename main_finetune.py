@@ -9,6 +9,8 @@ import json
 import numpy as np
 import os
 import time
+import pandas as pd
+import ipdb
 from pathlib import Path
 
 import torch
@@ -17,10 +19,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+# assert timm.__version__ == "0.9.12" # version check
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+
+from torchsummary import summary
 
 import util.lr_decay as lrd
 import util.misc as misc
@@ -113,10 +117,12 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/jupyter/Mor_DR_data/data/data/IDRID/Disease_Grading/', type=str,
+    parser.add_argument('--data_path', default='/home/ttn/Development/eye-age/Good_quality', type=str,
                         help='dataset path')
-    parser.add_argument('--nb_classes', default=1000, type=int,
+    parser.add_argument('--nb_classes', default=0, type=int,
                         help='number of the classification types')
+    parser.add_argument('--fold', default=0, type=int,
+                        help='fold number from 1 to 5')
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -150,6 +156,30 @@ def get_args_parser():
 
     return parser
 
+def write_csv(model, data_loader_test, device):
+    model.eval()
+    test_preds = []
+    test_trues = []
+    test_paths = []
+    output_path = os.path.join(args.output_dir, f'test_results_{args.fold}.csv')
+    print(f'Writing test results to {output_path}...')
+    with torch.no_grad():
+        for batch in data_loader_test:
+            inputs = batch[0].to(device)
+            test_true = batch[1].to(device)
+            paths = batch[2]
+            outputs = model(inputs)
+            test_preds.append(outputs)
+            test_trues.append(test_true)
+            test_paths.append(paths)
+    test_preds = np.concatenate([x.cpu().numpy() for x in test_preds])[:,0]
+    test_trues = np.concatenate([x.cpu().numpy() for x in test_trues])
+    test_paths = np.concatenate([x for x in test_paths])
+    mrns = [path.split('-')[0] for path in test_paths]
+    dates = [path.split('-')[1] for path in test_paths]
+    df = pd.DataFrame({'mrn': mrns, 'date': dates, 'pred': test_preds, 'true': test_trues})
+    df.to_csv(os.path.join(args.output_dir, f'test_results_{args.fold}.csv'), index=False)
+    print(f'Finished writing test results to {output_path}')
 
 def main(args):
     misc.init_distributed_mode(args)
@@ -169,6 +199,20 @@ def main(args):
     dataset_train = build_dataset(is_train='train', args=args)
     dataset_val = build_dataset(is_train='val', args=args)
     dataset_test = build_dataset(is_train='test', args=args)
+
+    train_mrns = set(dataset_train.data['MRN'])
+    val_mrns = set(dataset_val.data['MRN'])
+    test_mrns = set(dataset_test.data['MRN'])
+
+    print(f'Train MRNs ({len(train_mrns)}):')
+    print(train_mrns)
+    print(f'Val MRNs ({len(val_mrns)}):')
+    print(val_mrns)
+    print(f'Test MRNs ({len(test_mrns)}):')
+    print(test_mrns)
+    print(f'{len(train_mrns.intersection(val_mrns))} MRNs in both train and val sets')
+    print(f'{len(train_mrns.intersection(test_mrns))} MRNs in both train and test sets')
+    print(f'{len(val_mrns.intersection(test_mrns))} MRNs in both val and test sets')
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -225,7 +269,8 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=False
+        drop_last=False,
+        shuffle=False
     )
     
     
@@ -262,6 +307,11 @@ def main(args):
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
+        print('Missing keys:')
+        print(msg.missing_keys)
+
+        model.to('cuda:0')
+        # summary(model, (3, 224, 224))
 
         if args.global_pool:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
@@ -308,7 +358,7 @@ def main(args):
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.L1Loss()
 
     print("criterion = %s" % str(criterion))
 
@@ -316,12 +366,13 @@ def main(args):
 
     if args.eval:
         test_stats,auc_roc = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
+        write_csv(model, data_loader_test, device)
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
-    max_auc = 0.0
+    min_loss = np.inf
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -334,20 +385,25 @@ def main(args):
         )
 
         val_stats,val_auc_roc = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',num_class=args.nb_classes)
-        if max_auc<val_auc_roc:
-            max_auc = val_auc_roc
+        if min_loss>val_auc_roc:
+            prev_min_loss = min_loss
+            min_loss = val_auc_roc
             
             if args.output_dir:
+                print('val loss improved from {:.4f} to {:.4f}, saving new best model...'.format(prev_min_loss, val_auc_roc))
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch)
-        
+        else:
+            print('val loss did not improve from {:.4f}'.format(prev_min_loss))
+
         if log_writer is not None:
-            log_writer.add_scalar('perf/val_acc1', val_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/val_auc', val_auc_roc, epoch)
+            log_writer.add_scalar('perf/mae', val_stats['mae'], epoch)
+            log_writer.add_scalar('perf/r2', val_stats['r2'], epoch)
             log_writer.add_scalar('perf/val_loss', val_stats['loss'], epoch)
             
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        **{f'val_{k}': v for k, v in val_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
 
@@ -364,6 +420,8 @@ def main(args):
     state_dict_best = torch.load(args.task+'checkpoint-best.pth', map_location='cpu')
     model_without_ddp.load_state_dict(state_dict_best['model'])
     test_stats,auc_roc = evaluate(data_loader_test, model_without_ddp, device,args.task,epoch=0, mode='test',num_class=args.nb_classes)
+    write_csv(model, data_loader_test, device)
+
 
 if __name__ == '__main__':
     args = get_args_parser()
