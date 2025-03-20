@@ -126,7 +126,7 @@ def main(args):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = EyeAgeDataset(csv_file='data.csv', root_dir='Good_quality', transform=transform_train)
+    dataset_train = EyeAgeDataset(transform=transform_train)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()

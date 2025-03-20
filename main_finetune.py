@@ -117,7 +117,7 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/ttn/Development/eye-age/Good_quality', type=str,
+    parser.add_argument('--data_path', default='/home/ttn/Development/eye-age/AutoMorph/Results/M1/Good_quality', type=str,
                         help='dataset path')
     parser.add_argument('--nb_classes', default=0, type=int,
                         help='number of the classification types')
@@ -161,7 +161,7 @@ def write_csv(model, data_loader_test, device):
     test_preds = []
     test_trues = []
     test_paths = []
-    output_path = os.path.join(args.output_dir, f'test_results_{args.fold}.csv')
+    output_path = os.path.join(args.output_dir, f'{args.task}_{args.fold}.csv')
     print(f'Writing test results to {output_path}...')
     with torch.no_grad():
         for batch in data_loader_test:
@@ -175,9 +175,9 @@ def write_csv(model, data_loader_test, device):
     test_preds = np.concatenate([x.cpu().numpy() for x in test_preds])[:,0]
     test_trues = np.concatenate([x.cpu().numpy() for x in test_trues])
     test_paths = np.concatenate([x for x in test_paths])
-    mrns = [path.split('-')[0] for path in test_paths]
-    dates = [path.split('-')[1] for path in test_paths]
-    df = pd.DataFrame({'mrn': mrns, 'date': dates, 'pred': test_preds, 'true': test_trues})
+    mrns = [path.split('_')[0] for path in test_paths]
+    # dates = [path.split('-')[1] for path in test_paths]
+    df = pd.DataFrame({'mrn': mrns, 'pred': test_preds, 'true': test_trues})
     df.to_csv(os.path.join(args.output_dir, f'test_results_{args.fold}.csv'), index=False)
     print(f'Finished writing test results to {output_path}')
 
@@ -205,11 +205,8 @@ def main(args):
     test_mrns = set(dataset_test.data['MRN'])
 
     print(f'Train MRNs ({len(train_mrns)}):')
-    print(train_mrns)
     print(f'Val MRNs ({len(val_mrns)}):')
-    print(val_mrns)
     print(f'Test MRNs ({len(test_mrns)}):')
-    print(test_mrns)
     print(f'{len(train_mrns.intersection(val_mrns))} MRNs in both train and val sets')
     print(f'{len(train_mrns.intersection(test_mrns))} MRNs in both train and test sets')
     print(f'{len(val_mrns.intersection(test_mrns))} MRNs in both val and test sets')
@@ -365,7 +362,7 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats,auc_roc = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
+        test_stats,auc_roc = evaluate(data_loader_test, model, device, args.task, criterion, epoch=0, mode='test',num_class=args.nb_classes)
         write_csv(model, data_loader_test, device)
         exit(0)
 

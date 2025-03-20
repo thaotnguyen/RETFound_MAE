@@ -7,9 +7,10 @@ from PIL import Image
 
 from torch.utils.data import Dataset, DataLoader
 
-
 class EyeAgeDataset(Dataset):
-    def __init__(self, csv_file='../data.csv', root_dir='Good_quality', transform=None, fold=0, is_train=True):
+    # def __init__(self, csv_file='../data.csv', root_dir='flipped_good_quality', transform=None, fold=0, is_train=True):
+    def __init__(self, csv_file='../aireadi_data.csv', root_dir='/home/ttn/Development/eye-age/AutoMorph/Results/M1/Good_quality', transform=None, fold=0, is_train=True):
+    
         """
         Arguments:
             csv_file (string): Path to the csv file with annotations.
@@ -18,13 +19,12 @@ class EyeAgeDataset(Dataset):
                 on a sample.
         """
         self.data = pd.read_csv(csv_file)
-        self.train_set = self.data[(self.data['fold'] != fold) & (self.data['val_fold'] != 0)]
-        self.train_mean_age = self.train_set['Age'].mean()
-        self.train_std_age = self.train_set['Age'].std()
+        self.train_set = self.data[self.data['fold'] != fold]
         if is_train == 'test':
             self.data = self.data[self.data['fold'] == fold]
-            # self.data = pd.read_csv('/home/ttn/Development/primates/data.csv')
-            # root_dir = '/home/ttn/Development/primates/AutoMorph/Results/M1/Good_quality'
+            # self.data = pd.read_csv('/home/ttn/Development/eye-age/aireadi_data.csv')
+            print(f'test data shape: {self.data.shape}')
+            # root_dir = '/home/ttn/Development/eye-age/AutoMorph/Results/M1/Good_quality'
         else:
             self.data = self.data[self.data['fold'] != fold]
             if is_train == 'train':
@@ -46,11 +46,9 @@ class EyeAgeDataset(Dataset):
                                 self.data.path.iloc[idx])
         with open(img_name, 'rb') as f:
             image = Image.open(f).convert('RGB')
-        age = self.data['Age'].iloc[idx]
+        target = self.data['moca_gap'].iloc[idx]
         sample = image
-        target = age
         path = self.data['path'].iloc[idx]
-        # target = (age - self.train_mean_age) / self.train_std_age
 
         if self.transform:
             sample = self.transform(sample)
