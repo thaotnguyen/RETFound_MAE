@@ -10,7 +10,7 @@ from timm.data import Mixup
 from timm.utils import accuracy
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, f1_score, average_precision_score,
-    hamming_loss, jaccard_score, recall_score, precision_score, cohen_kappa_score
+    hamming_loss, jaccard_score, recall_score, precision_score, cohen_kappa_score, r2_score, mean_absolute_error
 )
 from pycm import ConfusionMatrix
 import util.misc as misc
@@ -19,6 +19,7 @@ import util.lr_sched as lr_sched
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
+    problem: str,
     data_loader: Iterable,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -39,7 +40,7 @@ def train_one_epoch(
     if log_writer:
         print(f'log_dir: {log_writer.log_dir}')
     
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, f'Epoch: [{epoch}]')):
+    for data_iter_step, (samples, targets, _) in enumerate(metric_logger.log_every(data_loader, print_freq, f'Epoch: [{epoch}]')):
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
         
@@ -49,7 +50,7 @@ def train_one_epoch(
         
         with torch.cuda.amp.autocast():
             outputs = model(samples)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs.squeeze(), targets)
         loss_value = loss.item()
         loss /= accum_iter
         
@@ -82,9 +83,8 @@ def train_one_epoch(
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, args, epoch, mode, num_class, log_writer):
+def evaluate(data_loader, model, criterion, problem, device, args, epoch, mode, num_class, log_writer):
     """Evaluate the model."""
-    criterion = nn.CrossEntropyLoss()
     metric_logger = misc.MetricLogger(delimiter="  ")
     os.makedirs(os.path.join(args.output_dir, args.task), exist_ok=True)
     
@@ -92,43 +92,57 @@ def evaluate(data_loader, model, device, args, epoch, mode, num_class, log_write
     true_onehot, pred_onehot, true_labels, pred_labels, pred_softmax = [], [], [], [], []
     
     for batch in metric_logger.log_every(data_loader, 10, f'{mode}:'):
-        images, target = batch[0].to(device, non_blocking=True), batch[-1].to(device, non_blocking=True)
-        target_onehot = F.one_hot(target.to(torch.int64), num_classes=num_class)
+        images, target = batch[0].to(device, non_blocking=True), torch.Tensor(batch[1]).to(device, non_blocking=True)
+        # target_onehot = F.one_hot(target.to(torch.int64), num_classes=num_class)
         
         with torch.cuda.amp.autocast():
             output = model(images)
-            loss = criterion(output, target)
-        output_ = nn.Softmax(dim=1)(output)
-        output_label = output_.argmax(dim=1)
-        output_onehot = F.one_hot(output_label.to(torch.int64), num_classes=num_class)
+            loss = criterion(output.squeeze(), target)
+
+        if problem == 'classification':
+            output = nn.Softmax(dim=1)(output)
+            output = output.argmax(dim=1)
+            # output_onehot = F.one_hot(output_label.to(torch.int64), num_classes=num_class)    
         
         metric_logger.update(loss=loss.item())
-        true_onehot.extend(target_onehot.cpu().numpy())
-        pred_onehot.extend(output_onehot.detach().cpu().numpy())
+        # true_onehot.extend(target_onehot.cpu().numpy())
+        # pred_onehot.extend(output_onehot.detach().cpu().numpy())
         true_labels.extend(target.cpu().numpy())
-        pred_labels.extend(output_label.detach().cpu().numpy())
-        pred_softmax.extend(output_.detach().cpu().numpy())
+        pred_labels.extend(output.detach().cpu().numpy())
+        # pred_softmax.extend(output_.detach().cpu().numpy())
     
-    accuracy = accuracy_score(true_labels, pred_labels)
-    hamming = hamming_loss(true_onehot, pred_onehot)
-    jaccard = jaccard_score(true_onehot, pred_onehot, average='macro')
-    average_precision = average_precision_score(true_onehot, pred_softmax, average='macro')
-    kappa = cohen_kappa_score(true_labels, pred_labels)
-    f1 = f1_score(true_onehot, pred_onehot, zero_division=0, average='macro')
-    roc_auc = roc_auc_score(true_onehot, pred_softmax, multi_class='ovr', average='macro')
-    precision = precision_score(true_onehot, pred_onehot, zero_division=0, average='macro')
-    recall = recall_score(true_onehot, pred_onehot, zero_division=0, average='macro')
+    if problem == 'classification':
+        accuracy = accuracy_score(true_labels, pred_labels)
+        hamming = hamming_loss(true_labels, pred_labels)
+        jaccard = jaccard_score(true_labels, pred_labels, average='macro')
+        # average_precision = average_precision_score(true_labels, pred_softmax, average='macro')
+        kappa = cohen_kappa_score(true_labels, pred_labels)
+        f1 = f1_score(true_labels, pred_labels, zero_division=0, average='binary', pos_label=1)
+        roc_auc = roc_auc_score(true_labels, pred_labels, multi_class='ovr', average='macro')
+        precision = precision_score(true_labels, pred_labels, zero_division=0, average='macro')
+        recall = recall_score(true_labels, pred_labels, zero_division=0, average='binary', pos_label=1)
+        specificity = recall_score(true_labels, pred_labels, zero_division=0, average='binary', pos_label=0)
+        # score = (f1 + roc_auc + kappa) / 3
+        score = f1
+    else:
+        r2 = r2_score(true_labels, pred_labels)
+        mae = mean_absolute_error(true_labels, pred_labels)
+        score = mae
     
-    score = (f1 + roc_auc + kappa) / 3
+    
     if log_writer:
-        for metric_name, value in zip(['accuracy', 'f1', 'roc_auc', 'hamming', 'jaccard', 'precision', 'recall', 'average_precision', 'kappa', 'score'],
-                                       [accuracy, f1, roc_auc, hamming, jaccard, precision, recall, average_precision, kappa, score]):
-            log_writer.add_scalar(f'perf/{metric_name}', value, epoch)
+        if problem == 'classification':
+            for metric_name, value in zip(['accuracy', 'f1', 'roc_auc', 'hamming', 'jaccard', 'precision', 'recall', 'kappa', 'score'],
+                                        [accuracy, f1, roc_auc, hamming, jaccard, precision, recall, kappa, score]):
+                log_writer.add_scalar(f'perf/{metric_name}', value, epoch)
+            print(f'Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Sensitivity: {recall:.4f}, Specificity: {specificity:.4f}')
+        else:
+            for metric_name, value in zip(['mae', 'r2'],
+                                        [mae, r2]):
+                log_writer.add_scalar(f'perf/{metric_name}', value, epoch)
+            print(f'MAE: {mae:.4f}, R2: {r2:.4f}')
     
     print(f'val loss: {metric_logger.meters["loss"].global_avg}')
-    print(f'Accuracy: {accuracy:.4f}, F1 Score: {f1:.4f}, ROC AUC: {roc_auc:.4f}, Hamming Loss: {hamming:.4f},\n'
-          f' Jaccard Score: {jaccard:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f},\n'
-          f' Average Precision: {average_precision:.4f}, Kappa: {kappa:.4f}, Score: {score:.4f}')
     
     metric_logger.synchronize_between_processes()
     
@@ -137,8 +151,12 @@ def evaluate(data_loader, model, device, args, epoch, mode, num_class, log_write
     with open(results_path, 'a', newline='', encoding='utf8') as cfa:
         wf = csv.writer(cfa)
         if not file_exists:
-            wf.writerow(['val_loss', 'accuracy', 'f1', 'roc_auc', 'hamming', 'jaccard', 'precision', 'recall', 'average_precision', 'kappa'])
-        wf.writerow([metric_logger.meters["loss"].global_avg, accuracy, f1, roc_auc, hamming, jaccard, precision, recall, average_precision, kappa])
+            if problem == 'classification':
+                wf.writerow(['val_loss', 'accuracy', 'f1', 'roc_auc', 'hamming', 'jaccard', 'precision', 'recall', 'kappa'])
+                wf.writerow([metric_logger.meters["loss"].global_avg, accuracy, f1, roc_auc, hamming, jaccard, precision, recall, kappa])
+            else:
+                wf.writerow([metric_logger.meters["loss"].global_avg, mae, r2])
+                wf.writerow(['val_loss', 'mae', 'r2'])
     
     if mode == 'test':
         cm = ConfusionMatrix(actual_vector=true_labels, predict_vector=pred_labels)

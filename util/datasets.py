@@ -4,15 +4,23 @@
 # --------------------------------------------------------
 
 import os
+from eye_age_dataset import EyeAgeDataset
 from torchvision import datasets, transforms
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
+# def build_dataset(is_train, args):
+#     transform = build_transform(is_train, args)
+#     root = os.path.join(args.data_path, is_train)
+#     dataset = datasets.ImageFolder(root, transform=transform)
+
+#     return dataset
+
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
-    root = os.path.join(args.data_path, is_train)
-    dataset = datasets.ImageFolder(root, transform=transform)
+    # root = os.path.join(args.data_path, is_train)
+    dataset = EyeAgeDataset(fold=args.fold, transform=transform, is_train=is_train)
 
     return dataset
 
@@ -34,6 +42,9 @@ def build_transform(is_train, args):
             re_count=args.recount,
             mean=mean,
             std=std,
+            # # From APTOS dataset (Kaggle)
+            # mean=[0.239597886800766, 0.2362600862979889, 0.23300714790821075],
+            # std=[0.23709170520305634, 0.23014824092388153, 0.23441201448440552],
         )
         return transform
 

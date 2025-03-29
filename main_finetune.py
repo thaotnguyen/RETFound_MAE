@@ -2,12 +2,15 @@ import argparse
 import datetime
 import json
 
+import ipdb
 import numpy as np
 import os
 import time
 from pathlib import Path
+import pandas as pd
 
 import torch
+import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 from timm.models.layers import trunc_normal_
@@ -98,6 +101,8 @@ def get_args_parser():
                         help='finetune from checkpoint')
     parser.add_argument('--task', default='', type=str,
                         help='finetune from checkpoint')
+    parser.add_argument('--problem', default='classification', type=str,
+                        help='classification or regression')
     parser.add_argument('--global_pool', action='store_true')
     parser.set_defaults(global_pool=True)
     parser.add_argument('--cls_token', action='store_false', dest='global_pool',
@@ -108,6 +113,9 @@ def get_args_parser():
                         help='dataset path')
     parser.add_argument('--nb_classes', default=8, type=int,
                         help='number of the classification types')
+    parser.add_argument('--fold', default=0, type=int,
+                        help='fold number from 1 to 5')
+
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_logs',
@@ -221,6 +229,16 @@ def main(args, criterion):
     dataset_val = build_dataset(is_train='val', args=args)
     dataset_test = build_dataset(is_train='test', args=args)
 
+    train_mrns = set(dataset_train.data['MRN'])
+    val_mrns = set(dataset_val.data['MRN'])
+    test_mrns = set(dataset_test.data['MRN'])
+
+    print(f'Train MRNs ({len(train_mrns)}):')
+    print(f'Val MRNs ({len(val_mrns)}):')
+    print(f'Test MRNs ({len(test_mrns)}):')
+    print(f'{len(train_mrns.intersection(val_mrns))} MRNs in both train and val sets')
+    print(f'{len(train_mrns.intersection(test_mrns))} MRNs in both train and test sets')
+    print(f'{len(val_mrns.intersection(test_mrns))} MRNs in both val and test sets')
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -336,45 +354,50 @@ def main(args, criterion):
     if args.eval:
         if 'epoch' in checkpoint:
             print("Test with the best model at epoch = %d" % checkpoint['epoch'])
-        test_stats, auc_roc = evaluate(data_loader_test, model, device, args, epoch=0, mode='test',
+        test_stats, auc_roc = evaluate(data_loader_test, model, criterion, args.problem, device, args, epoch=0, mode='test',
                                        num_class=args.nb_classes, log_writer=log_writer)
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_score = 0.0
+    if args.problem == 'classification':
+        max_score = 0
+    else:
+        max_score = float('inf')
     best_epoch = 0
+    # Early stopping parameters
+    patience = 25  # Number of epochs to wait
+    counter = 0    # Counter for tracking patience
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
+            model, criterion, args.problem, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, mixup_fn,
             log_writer=log_writer,
             args=args
         )
-
-        val_stats, val_score = evaluate(data_loader_val, model, device, args, epoch, mode='val',
+        
+        # Check for early stopping
+        val_stats, val_score = evaluate(data_loader_val, model, criterion, args.problem, device, args, epoch, mode='val',
                                         num_class=args.nb_classes, log_writer=log_writer)
-        if max_score < val_score:
+        if (max_score < val_score and args.problem == 'classification') or (max_score > val_score and args.problem == 'regression'):
             max_score = val_score
             best_epoch = epoch
+            counter = 0  # Reset counter when validation score improves
+
             if args.output_dir and args.savemodel:
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, mode='best')
+        else:
+            counter += 1
+            print(f'Early stopping counter: {counter} out of {patience}')
+            
         print("Best epoch = %d, Best score = %.4f" % (best_epoch, max_score))
-
-
-        if epoch == (args.epochs - 1):
-            checkpoint = torch.load(os.path.join(args.output_dir, args.task, 'checkpoint-best.pth'), map_location='cpu')
-            model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-            model.to(device)
-            print("Test with the best model, epoch = %d:" % checkpoint['epoch'])
-            test_stats, auc_roc = evaluate(data_loader_test, model, device, args, -1, mode='test',
-                                           num_class=args.nb_classes, log_writer=None)
 
         if log_writer is not None:
             log_writer.add_scalar('loss/val', val_stats['loss'], epoch)
@@ -389,16 +412,55 @@ def main(args, criterion):
             with open(os.path.join(args.output_dir, args.task, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
+        if epoch == (args.epochs - 1) or counter == patience:
+            checkpoint = torch.load(os.path.join(args.output_dir, args.task, 'checkpoint-best.pth'), map_location='cpu')
+            model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            model.to(device)
+            print("Test with the best model, epoch = %d:" % checkpoint['epoch'])
+            test_stats, auc_roc = evaluate(data_loader_test, model, criterion, args.problem, device, args, -1, mode='test',
+                                           num_class=args.nb_classes, log_writer=None)
+            break
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    write_csv(model, data_loader_test, device, task=args.task)
 
+def write_csv(model, data_loader_test, device, task='classification'):
+    model.eval()
+    test_preds = []
+    test_trues = []
+    test_paths = []
+    output_path = os.path.join(args.output_dir, f'{args.task.replace('/','')}.csv')
+    print(f'Writing test results to {output_path}...')
+    with torch.no_grad():
+        for batch in data_loader_test:
+            images, target, paths = batch
+            output = model(images)
+            if args.problem == 'classification':
+                output = nn.Softmax(dim=1)(output)
+                output = output.argmax(dim=1)
+
+            test_trues.extend(target.squeeze().cpu().numpy())
+            test_preds.extend(output.squeeze().detach().cpu().numpy())
+            test_paths.extend(paths)
+
+    test_preds = np.array([x for x in test_preds])
+    test_trues = np.array([x for x in test_trues])
+    # test_paths = np.concatenate([x for x in test_paths])
+    mrns = test_paths
+    df = pd.DataFrame({'mrn': mrns, 'pred': test_preds, 'true': test_trues})
+    df.to_csv(os.path.join(args.output_dir, f'{args.task.replace('/','')}.csv'), index=False)
+    print(f'Finished writing test results to {output_path}')
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
 
-    criterion = torch.nn.CrossEntropyLoss()
+    if args.problem == 'classification':
+        criterion = torch.nn.CrossEntropyLoss()
+    else:
+        criterion = torch.nn.L1Loss()
 
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)

@@ -63,6 +63,7 @@ def RETFound_dinov2(args, **kwargs):
         img_size=224,
         **kwargs
     )
+
     return model
 
 
